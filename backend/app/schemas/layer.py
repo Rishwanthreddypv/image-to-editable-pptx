@@ -1,4 +1,4 @@
-from typing import List
+from typing import List, Optional
 from pydantic import BaseModel
 
 class GeometryBase(BaseModel):
@@ -11,6 +11,7 @@ class LayerBase(BaseModel):
     type: str
     geometry: GeometryBase
     content: dict
+    style: Optional[dict] = {}
 
 class LayerCreate(LayerBase):
     pass

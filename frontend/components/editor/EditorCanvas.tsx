@@ -5,14 +5,37 @@ import { useEffect, useRef, useState } from 'react';
 import useImage from 'use-image';
 
 export const EditorCanvas = () => {
-  const { document, selectedLayerId, selectLayer, updateLayer, pageSettings } = useDocumentStore();
+  const { document, selectedLayerId, selectLayer, updateLayer, deleteLayer, pageSettings } = useDocumentStore();
   const trRef = useRef<any>(null);
   const selectionRef = useRef<any>(null);
   const containerRef = useRef<HTMLDivElement>(null);
   const [scale, setScale] = useState(1);
+
+  // Handle keyboard deletion
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if ((e.key === 'Delete' || e.key === 'Backspace') && selectedLayerId) {
+        // Prevent deleting if typing in an input (though Konva handles its own text)
+        if (window.document.activeElement?.tagName !== 'INPUT' && 
+            window.document.activeElement?.tagName !== 'TEXTAREA') {
+          deleteLayer(selectedLayerId);
+        }
+      }
+    };
+
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, [selectedLayerId, deleteLayer]);
   
   const backendUrl = process.env.NEXT_PUBLIC_API_URL?.replace('/api/v1', '') || 'http://localhost:8000';
-  const [img] = useImage(document?.sourceImage ? `${backendUrl}${document.sourceImage}` : '');
+  const imageUrl = document?.sourceImage 
+    ? `${backendUrl}${document.sourceImage.split('/').map(segment => encodeURIComponent(segment)).join('/')}`.replace(/%3A/g, ':').replace(/http%3A/g, 'http:')
+    : '';
+  
+  // Custom URL correction for common encoding issues
+  const fixedImageUrl = imageUrl.replace('http%3A//', 'http://').replace('https%3A//', 'https://');
+
+  const [img] = useImage(fixedImageUrl, 'anonymous');
 
   // Responsive scaling logic
   useEffect(() => {
@@ -99,9 +122,11 @@ export const EditorCanvas = () => {
 
           {/* Content Layer */}
           <Layer>
-            {document.layers.map((layer) => {
-              const isSelected = selectedLayerId === layer.id;
-              const style = layer.style || {};
+            {document.layers
+              .filter(layer => layer.type !== 'figure')
+              .map((layer) => {
+                const isSelected = selectedLayerId === layer.id;
+                const style = layer.style || {};
               
               if (layer.type === 'text') {
                 return (
@@ -221,6 +246,66 @@ export const EditorCanvas = () => {
                         />
                       </Group>
                     ))}
+                  </Group>
+                );
+              }
+
+              if (layer.type === 'image') {
+                return (
+                  <Group
+                    key={layer.id}
+                    id={layer.id}
+                    x={layer.geometry.x}
+                    y={layer.geometry.y}
+                    draggable
+                    onClick={() => selectLayer(layer.id)}
+                    ref={isSelected ? selectionRef : null}
+                    onDragMove={(e) => {
+                      if (pageSettings.snapToGrid) {
+                        const target = e.target;
+                        target.x(snap(target.x()));
+                        target.y(snap(target.y()));
+                      }
+                    }}
+                    onDragEnd={(e) => {
+                      updateLayer(layer.id, {
+                        geometry: { 
+                          ...layer.geometry, 
+                          x: snap(e.target.x()), 
+                          y: snap(e.target.y()) 
+                        }
+                      });
+                    }}
+                  >
+                    {!img && (
+                      <Rect
+                        width={layer.geometry.w}
+                        height={layer.geometry.h}
+                        fill="rgba(241, 245, 249, 0.5)"
+                        stroke="#94a3b8"
+                        strokeWidth={1}
+                        dash={[5, 5]}
+                      />
+                    )}
+                    <KonvaImage
+                      image={img}
+                      width={layer.geometry.w}
+                      height={layer.geometry.h}
+                      crop={{
+                        x: layer.geometry.x * ((img?.width || 1280) / 1280),
+                        y: layer.geometry.y * ((img?.height || 720) / 720),
+                        width: layer.geometry.w * ((img?.width || 1280) / 1280),
+                        height: layer.geometry.h * ((img?.height || 720) / 720)
+                      }}
+                    />
+                    {isSelected && (
+                      <Rect
+                        width={layer.geometry.w}
+                        height={layer.geometry.h}
+                        stroke="#3b82f6"
+                        strokeWidth={2}
+                      />
+                    )}
                   </Group>
                 );
               }

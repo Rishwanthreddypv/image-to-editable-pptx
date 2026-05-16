@@ -12,6 +12,7 @@ interface DocumentState {
   setDocument: (doc: EditableDocument) => void;
   selectLayer: (id: string | null) => void;
   updateLayer: (id: string, updates: Partial<DocumentLayer>) => void;
+  deleteLayer: (id: string) => void;
   updatePageSettings: (updates: Partial<PageSettings>) => void;
   setLoading: (loading: boolean) => void;
   
@@ -62,6 +63,22 @@ export const useDocumentStore = create<DocumentState>((set) => ({
       document: newDoc,
       history: newHistory,
       historyIndex: newHistory.length - 1
+    };
+  }),
+
+  deleteLayer: (id) => set((state) => {
+    if (!state.document) return state;
+    const newLayers = state.document.layers.filter(l => l.id !== id);
+    const newDoc = { ...state.document, layers: newLayers };
+    
+    const newHistory = state.history.slice(0, state.historyIndex + 1);
+    newHistory.push(newDoc);
+    
+    return {
+      document: newDoc,
+      history: newHistory,
+      historyIndex: newHistory.length - 1,
+      selectedLayerId: state.selectedLayerId === id ? null : state.selectedLayerId
     };
   }),
 

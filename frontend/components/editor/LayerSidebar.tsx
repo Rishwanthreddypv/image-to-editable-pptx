@@ -22,10 +22,12 @@ export const LayerSidebar = () => {
         Layers
       </div>
       <div className="flex-1 overflow-y-auto">
-        {document?.layers.map((layer) => (
-          <div
-            key={layer.id}
-            onClick={() => selectLayer(layer.id)}
+        {document?.layers
+          .filter(layer => layer.type !== 'figure')
+          .map((layer) => (
+            <div
+              key={layer.id}
+              onClick={() => selectLayer(layer.id)}
             className={clsx(
               "px-4 py-3 flex items-center gap-3 cursor-pointer transition-colors border-b",
               selectedLayerId === layer.id ? "bg-blue-50 text-blue-700" : "hover:bg-slate-50"

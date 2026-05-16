@@ -28,7 +28,8 @@ async def get_document(
     return {
         "id": project_id, 
         "layers": doc.get("layers", []),
-        "sourceImage": doc.get("sourceImage")
+        "sourceImage": doc.get("sourceImage"),
+        "background_color": doc.get("background_color", "#ffffff")
     }
 
 @router.put("/{project_id}")

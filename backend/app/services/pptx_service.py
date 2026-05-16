@@ -93,6 +93,7 @@ class PPTXService:
         # Apply the 0.75 scale factor to the font size
         p.font.size = Pt(font_size_px * PT_PER_PX)
         p.font.name = style.get('fontFamily', 'Arial')
+        p.font.bold = style.get('fontWeight') == 'bold'
         
         if 'color' in style:
             try:
@@ -140,15 +141,58 @@ class PPTXService:
                         run.font.name = 'Arial'
 
     def _add_image(self, slide, layer, sx, sy):
-        # Placeholder: In a real app, we'd fetch the image from storage
-        # For now, we add a placeholder rectangle with text
+        from PIL import Image
+        import os
+        
+        # Use exact geometry provided by the layer.
+        # Padding is now handled at the source (gemini_service) so preview and export are identical.
         left = int(layer.geometry.x * sx)
         top = int(layer.geometry.y * sy)
         width = int(layer.geometry.w * sx)
         height = int(layer.geometry.h * sy)
         
+        original_image_path = layer.content.get('original_image')
+        if original_image_path and os.path.exists(original_image_path):
+            try:
+                # Crop the image for the PPTX
+                with Image.open(original_image_path) as img:
+                    img_w, img_h = img.size
+                    # Scale factor from 1280x720 space to actual image pixel grid
+                    scale_w = img_w / 1280
+                    scale_h = img_h / 720
+                    
+                    # Crop box using the source-padded geometry
+                    crop_box = (
+                        int(layer.geometry.x * scale_w),
+                        int(layer.geometry.y * scale_h),
+                        int((layer.geometry.x + layer.geometry.w) * scale_w),
+                        int((layer.geometry.y + layer.geometry.h) * scale_h)
+                    )
+                    
+                    # Ensure crop box is within image bounds
+                    crop_box = (
+                        max(0, crop_box[0]),
+                        max(0, crop_box[1]),
+                        min(img_w, crop_box[2]),
+                        min(img_h, crop_box[3])
+                    )
+                    
+                    if crop_box[2] > crop_box[0] and crop_box[3] > crop_box[1]:
+                        cropped_img = img.crop(crop_box)
+                        
+                        # Save cropped image to a buffer
+                        img_byte_arr = io.BytesIO()
+                        cropped_img.save(img_byte_arr, format='PNG')
+                        img_byte_arr.seek(0)
+                        
+                        slide.shapes.add_picture(img_byte_arr, left, top, width, height)
+                        return
+            except Exception as e:
+                logger.error(f"Failed to crop and add image to PPTX: {e}")
+
+        # Fallback to placeholder if cropping fails
         shape = slide.shapes.add_shape(1, left, top, width, height) # 1 = Rectangle
-        shape.text = "[Image Placeholder]"
+        shape.text = f"[Image: {layer.content.get('label', 'graphic')}]"
 
     def _add_shape(self, slide, layer, sx, sy):
         left = int(layer.geometry.x * sx)
