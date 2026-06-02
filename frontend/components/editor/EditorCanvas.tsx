@@ -38,6 +38,8 @@ export const EditorCanvas = () => {
   const trRef = useRef<any>(null);
   const selectionRef = useRef<any>(null);
   const containerRef = useRef<HTMLDivElement>(null);
+  const previousGeometryRef = useRef<Record<string, { x: number; y: number; w: number; h: number }>>({});
+  const hierarchyUpdateLockRef = useRef(false);
 
   const [fitScale, setFitScale] = useState(1);
   const [zoom, setZoom] = useState(1);
@@ -68,6 +70,276 @@ export const EditorCanvas = () => {
   const selectedLayer =
     document?.layers?.find((item: any) => item.id === selectedLayerId) || null;
   const layers = document?.layers ?? [];
+
+  const layerById = new Map(layers.map((layer: any) => [layer.id, layer]));
+  const documentRef = useRef(document);
+  const layersRef = useRef(layers);
+
+  useEffect(() => {
+    documentRef.current = document;
+    layersRef.current = layers;
+  }, [document, layers]);
+
+  const getLayerDepth = (layer: any) => {
+    const explicitDepth = Number(layer?.content?.depth);
+    if (Number.isFinite(explicitDepth)) {
+      return Math.max(0, explicitDepth);
+    }
+
+    const visited = new Set<string>();
+    let depth = 0;
+    let current = layer;
+
+    while (current?.content?.parent_id && !visited.has(current.id)) {
+      visited.add(current.id);
+      const parent = layerById.get(current.content.parent_id);
+      if (!parent) break;
+      depth += 1;
+      current = parent;
+    }
+
+    return depth;
+  };
+
+  const getLayerChildrenIds = (layer: any): string[] => {
+    const raw = layer?.content?.children_ids;
+    if (!Array.isArray(raw)) return [];
+    return raw.filter((value: any) => typeof value === 'string' && value.length > 0);
+  };
+
+  const getLayerDescendants = (layerId: string): string[] => {
+    const visited = new Set<string>();
+    const result: string[] = [];
+
+    const walk = (currentId: string) => {
+      const layer = layerById.get(currentId);
+      if (!layer) return;
+
+      for (const childId of getLayerChildrenIds(layer)) {
+        if (visited.has(childId)) continue;
+        visited.add(childId);
+        result.push(childId);
+        walk(childId);
+      }
+    };
+
+    walk(layerId);
+    return result;
+  };
+
+  const shiftLayerGeometry = (layerId: string, dx: number, dy: number) => {
+    const layer = layerById.get(layerId);
+    if (!layer) return;
+
+    const nextGeometry = {
+      ...(layer.geometry || {}),
+      x: (layer.geometry?.x || 0) + dx,
+      y: (layer.geometry?.y || 0) + dy,
+    };
+
+    if (layer.type === 'text') {
+      const textGeometry = layer.content?.text_geometry || layer.geometry;
+      updateLayer(layerId, {
+        geometry: nextGeometry,
+        content: {
+          ...(layer.content || {}),
+          text_geometry: {
+            ...textGeometry,
+            x: (textGeometry?.x || 0) + dx,
+            y: (textGeometry?.y || 0) + dy,
+          },
+        },
+      });
+      return;
+    }
+
+    updateLayer(layerId, {
+      geometry: nextGeometry,
+    });
+  };
+
+  const moveLayerTreeByDelta = (layerId: string, dx: number, dy: number) => {
+    shiftLayerGeometry(layerId, dx, dy);
+
+    const descendantIds = getLayerDescendants(layerId);
+    for (const descendantId of descendantIds) {
+      shiftLayerGeometry(descendantId, dx, dy);
+    }
+  };
+
+  const renderLayers = [...layers].sort((a: any, b: any) => {
+    const aDepth = getLayerDepth(a);
+    const bDepth = getLayerDepth(b);
+
+    if (a.type === 'connector' && b.type !== 'connector') return -1;
+    if (b.type === 'connector' && a.type !== 'connector') return 1;
+
+    if (aDepth !== bDepth) return aDepth - bDepth;
+
+    const ay = Number(a.geometry?.y || 0);
+    const by = Number(b.geometry?.y || 0);
+    if (ay !== by) return ay - by;
+
+    const ax = Number(a.geometry?.x || 0);
+    const bx = Number(b.geometry?.x || 0);
+    if (ax !== bx) return ax - bx;
+
+    return String(a.id).localeCompare(String(b.id));
+  });
+
+  const isHierarchyCandidate = (layer: any) =>
+    Boolean(layer && ['text', 'shape', 'container', 'table'].includes(layer.type));
+
+  const getHierarchyGeometry = (layer: any) => {
+    const source = layer?.type === 'text'
+      ? (layer?.content?.text_geometry || layer?.geometry || {})
+      : (layer?.geometry || {});
+
+    return {
+      x: Number(source.x || 0),
+      y: Number(source.y || 0),
+      w: Math.max(1, Number(source.w || 1)),
+      h: Math.max(1, Number(source.h || 1)),
+    };
+  };
+
+  const containsGeometry = (
+    outer: { x: number; y: number; w: number; h: number },
+    inner: { x: number; y: number; w: number; h: number }
+  ) => {
+    const margin = Math.max(2, Math.min(8, Math.min(outer.w, outer.h) * 0.03));
+
+    return (
+      inner.x >= outer.x + margin &&
+      inner.y >= outer.y + margin &&
+      inner.x + inner.w <= outer.x + outer.w - margin &&
+      inner.y + inner.h <= outer.y + outer.h - margin
+    );
+  };
+
+  const rebuildHierarchyFromGeometry = () => {
+    if (hierarchyUpdateLockRef.current) return;
+
+    const currentDocument = documentRef.current;
+    const currentLayers = layersRef.current ?? currentDocument?.layers ?? [];
+    const candidates = currentLayers.filter(isHierarchyCandidate);
+    if (!candidates.length) return;
+
+    hierarchyUpdateLockRef.current = true;
+
+    try {
+      const bboxLookup = new Map(
+        candidates.map((layer: any) => [layer.id, getHierarchyGeometry(layer)])
+      );
+
+      const parentMap = new Map<string, string>();
+      const childrenMap = new Map<string, string[]>();
+
+      for (const child of candidates) {
+        const childBox = bboxLookup.get(child.id);
+        if (!childBox) continue;
+
+        const containing: Array<[number, number, number, string]> = [];
+
+        for (const parent of candidates) {
+          if (parent.id === child.id) continue;
+          const parentBox = bboxLookup.get(parent.id);
+          if (!parentBox) continue;
+          if (!containsGeometry(parentBox, childBox)) continue;
+
+          const area = parentBox.w * parentBox.h;
+          containing.push([area, parentBox.y, parentBox.x, parent.id]);
+        }
+
+        if (!containing.length) continue;
+
+        containing.sort((a, b) => {
+          if (a[0] !== b[0]) return a[0] - b[0];
+          if (a[1] !== b[1]) return a[1] - b[1];
+          if (a[2] !== b[2]) return a[2] - b[2];
+          return a[3].localeCompare(b[3]);
+        });
+
+        const parentId = containing[0][3];
+        parentMap.set(child.id, parentId);
+
+        const list = childrenMap.get(parentId) || [];
+        list.push(child.id);
+        childrenMap.set(parentId, list);
+      }
+
+      const depthCache = new Map<string, number>();
+      const computeDepth = (layerId: string): number => {
+        if (depthCache.has(layerId)) return depthCache.get(layerId) as number;
+        const parentId = parentMap.get(layerId);
+        const depth = parentId ? computeDepth(parentId) + 1 : 0;
+        depthCache.set(layerId, depth);
+        return depth;
+      };
+
+      candidates.forEach((layer: any) => computeDepth(layer.id));
+
+      currentLayers.forEach((layer: any) => {
+        if (!isHierarchyCandidate(layer)) return;
+
+        const childIds = (childrenMap.get(layer.id) || []).slice().sort((a, b) => {
+          const geomA = bboxLookup.get(a);
+          const geomB = bboxLookup.get(b);
+          if (geomA && geomB) {
+            if (geomA.y !== geomB.y) return geomA.y - geomB.y;
+            if (geomA.x !== geomB.x) return geomA.x - geomB.x;
+          }
+          return a.localeCompare(b);
+        });
+
+        const depth = depthCache.get(layer.id) || 0;
+        const parentId = parentMap.get(layer.id) || null;
+        const existing = (layer.content && typeof layer.content === 'object') ? layer.content : {};
+        const nextContent: any = { ...existing };
+
+        if (parentId) nextContent.parent_id = parentId;
+        else delete nextContent.parent_id;
+
+        nextContent.children_ids = childIds;
+        nextContent.depth = depth;
+        nextContent.is_container = childIds.length > 0;
+
+        if (layer.type === 'text') {
+          if (parentId) nextContent.nesting_role = 'node';
+          else if (childIds.length) nextContent.nesting_role = 'text_container';
+          else nextContent.nesting_role = 'label';
+        } else {
+          nextContent.nesting_role = childIds.length ? 'container' : 'node';
+        }
+
+        const prevChildren = Array.isArray(existing.children_ids)
+          ? existing.children_ids.filter((value: any) => typeof value === 'string')
+          : [];
+        const changed =
+          (existing.parent_id || null) !== parentId ||
+          JSON.stringify(prevChildren) !== JSON.stringify(childIds) ||
+          Number(existing.depth || 0) !== depth ||
+          Boolean(existing.is_container) !== (childIds.length > 0) ||
+          (existing.nesting_role || null) !== nextContent.nesting_role;
+
+        if (changed) {
+          updateLayer(layer.id, { content: nextContent });
+        }
+      });
+    } finally {
+      hierarchyUpdateLockRef.current = false;
+    }
+  };
+
+  const scheduleHierarchyRefresh = () => {
+    if (hierarchyUpdateLockRef.current) return;
+
+    hierarchyUpdateLockRef.current = true;
+    window.setTimeout(() => {
+      hierarchyUpdateLockRef.current = false;
+      rebuildHierarchyFromGeometry();
+    }, 0);
+  };
 
   const getTextGeometry = (layer: any) => {
     return layer.content?.text_geometry || layer.geometry;
@@ -111,19 +383,32 @@ export const EditorCanvas = () => {
       content: Array.isArray(layer.content)
         ? [...layer.content]
         : layer.content && typeof layer.content === 'object'
-          ? {
-              ...layer.content,
-              points: Array.isArray(layer.content.points)
+          ? (() => {
+              const nextContent: any = {
+                ...layer.content,
+              };
+
+              delete nextContent.parent_id;
+              delete nextContent.children_ids;
+              delete nextContent.depth;
+              delete nextContent.is_container;
+              delete nextContent.nesting_role;
+              delete nextContent.linked_container_id;
+              delete nextContent.linked_text_id;
+
+              nextContent.points = Array.isArray(layer.content.points)
                 ? layer.content.points.map((pt: any) =>
                     Array.isArray(pt) ? [pt[0] + 24, pt[1] + 24] : pt
                   )
-                : layer.content.points,
-              endpoints: Array.isArray(layer.content.endpoints)
+                : layer.content.points;
+              nextContent.endpoints = Array.isArray(layer.content.endpoints)
                 ? layer.content.endpoints.map((pt: any) =>
                     Array.isArray(pt) ? [pt[0] + 24, pt[1] + 24] : pt
                   )
-                : layer.content.endpoints,
-            }
+                : layer.content.endpoints;
+
+              return nextContent;
+            })()
           : layer.content,
     };
 
@@ -186,16 +471,16 @@ export const EditorCanvas = () => {
           },
         });
       }
+
+      getLayerDescendants(layer.id).forEach((descendantId) => {
+        shiftLayerGeometry(descendantId, dx, dy);
+      });
+      scheduleHierarchyRefresh();
       return;
     }
 
-    updateLayer(layer.id, {
-      geometry: {
-        ...layer.geometry,
-        x: (layer.geometry?.x || 0) + dx,
-        y: (layer.geometry?.y || 0) + dy,
-      },
-    });
+    moveLayerTreeByDelta(layer.id, dx, dy);
+    scheduleHierarchyRefresh();
   };
 
   useEffect(() => {
@@ -292,7 +577,7 @@ export const EditorCanvas = () => {
 
   useEffect(() => {
     if (!document) return;
-    
+
 
     layers.forEach((layer: any) => {
       if (layer.type !== 'text') return;
@@ -311,6 +596,7 @@ export const EditorCanvas = () => {
       });
     });
   }, [document, updateLayer]);
+
 
 
   const renderGrid = () => {
@@ -418,6 +704,26 @@ export const EditorCanvas = () => {
         return null;
       }
 
+      const sourcePoint: [number, number] = [finalPoints[0], finalPoints[1]];
+      const targetPoint: [number, number] = [
+        finalPoints[finalPoints.length - 2],
+        finalPoints[finalPoints.length - 1],
+      ];
+
+      const sourceAttachment = findNearestConnectorAttachment(
+        sourcePoint[0],
+        sourcePoint[1]
+      );
+      const targetAttachment = findNearestConnectorAttachment(
+        targetPoint[0],
+        targetPoint[1]
+      );
+
+      const sourceLayerId = sourceAttachment?.layer?.id ?? null;
+      const targetLayerId = targetAttachment?.layer?.id ?? null;
+      const sourceAnchor = sourceAttachment?.anchor ?? null;
+      const targetAnchor = targetAttachment?.anchor ?? null;
+
       addLayer({
         id: makeId('connector'),
         type: 'connector',
@@ -429,12 +735,12 @@ export const EditorCanvas = () => {
           direction: 'forward',
           style: 'solid',
           manual_offset: { x: 0, y: 0 },
-          source_layer_id: null,
-          target_layer_id: null,
-          source_anchor: null,
-          target_anchor: null,
-          free_source_point: [finalPoints[0], finalPoints[1]],
-          free_target_point: [finalPoints[finalPoints.length - 2], finalPoints[finalPoints.length - 1]],
+          source_layer_id: sourceLayerId,
+          target_layer_id: targetLayerId,
+          source_anchor: sourceAnchor,
+          target_anchor: targetAnchor,
+          free_source_point: sourceLayerId ? null : sourcePoint,
+          free_target_point: targetLayerId ? null : targetPoint,
         },
         style: {
           stroke: '#ef4444',
@@ -702,25 +1008,40 @@ const setSelectedConnectorRouteMode = (routeMode: 'straight' | 'orthogonal') => 
 const findNearestConnectorAttachment = (x: number, y: number, excludeLayerId?: string) => {
   const layers = document?.layers || [];
   let best: any = null;
-  let bestDistance = Infinity;
+  let bestScore = Infinity;
   let bestAnchor: 'left' | 'right' | 'top' | 'bottom' = 'right';
+
+  const scoreForType = (type: string) => {
+    if (type === 'container') return 0;
+    if (type === 'shape') return 1;
+    if (type === 'table') return 2;
+    if (type === 'text') return 4;
+    return 3;
+  };
 
   for (const item of layers) {
     if (item.id === excludeLayerId) continue;
     if (!['text', 'shape', 'container', 'table'].includes(item.type)) continue;
 
-    const gx = Number(item.geometry?.x || 0);
-    const gy = Number(item.geometry?.y || 0);
-    const gw = Math.max(1, Number(item.geometry?.w || 0));
-    const gh = Math.max(1, Number(item.geometry?.h || 0));
+    const resolved = item.type === 'text' && item.content?.parent_id && item.content?.nesting_role === 'label'
+      ? layers.find((candidate: any) => candidate.id === item.content.parent_id) || item
+      : item;
+
+    if (!['text', 'shape', 'container', 'table'].includes(resolved.type)) continue;
+
+    const gx = Number(resolved.geometry?.x || 0);
+    const gy = Number(resolved.geometry?.y || 0);
+    const gw = Math.max(1, Number(resolved.geometry?.w || 0));
+    const gh = Math.max(1, Number(resolved.geometry?.h || 0));
 
     const clampedX = clamp(x, gx, gx + gw);
     const clampedY = clamp(y, gy, gy + gh);
     const distance = Math.hypot(x - clampedX, y - clampedY);
+    const weighted = distance + scoreForType(resolved.type) * 10;
 
-    if (distance < bestDistance) {
-      bestDistance = distance;
-      best = item;
+    if (weighted < bestScore) {
+      bestScore = weighted;
+      best = resolved;
 
       const cx = gx + gw / 2;
       const cy = gy + gh / 2;
@@ -735,7 +1056,7 @@ const findNearestConnectorAttachment = (x: number, y: number, excludeLayerId?: s
     }
   }
 
-  if (!best || bestDistance > 32) return null;
+  if (!best || bestScore > 64) return null;
 
   return {
     layer: best,
@@ -964,7 +1285,7 @@ const adjustSelectedConnectorThickness = (delta: number) => {
               />
             )}
             
-            {layers
+            {renderLayers
               .filter((layer: any) => layer.type !== 'figure')
               .map((layer: any) => {
                 const isSelected = selectedLayerId === layer.id;
@@ -1051,6 +1372,7 @@ const adjustSelectedConnectorThickness = (delta: number) => {
 
                             node.scaleX(1);
                             node.scaleY(1);
+                            scheduleHierarchyRefresh();
                           }}
                         />
                       )}
@@ -1082,6 +1404,8 @@ const adjustSelectedConnectorThickness = (delta: number) => {
                         onDragEnd={(e) => {
                           const nextX = snap(e.target.x());
                           const nextY = snap(e.target.y());
+                          const dx = nextX - (layer.geometry?.x || 0);
+                          const dy = nextY - (layer.geometry?.y || 0);
 
                           const nextTextGeometry = {
                             ...textGeometry,
@@ -1101,6 +1425,11 @@ const adjustSelectedConnectorThickness = (delta: number) => {
                             },
                           });
 
+                          const descendants = getLayerDescendants(layer.id);
+                          descendants.forEach((descendantId) => {
+                            shiftLayerGeometry(descendantId, dx, dy);
+                          });
+
                           if (showBorder && linkedContainerId) {
                             syncLinkedContainer(
                               nextX,
@@ -1110,6 +1439,8 @@ const adjustSelectedConnectorThickness = (delta: number) => {
                               true
                             );
                           }
+
+                          scheduleHierarchyRefresh();
                         }}
                         onTransformEnd={() => {
                           if (showBorder) {
@@ -1144,6 +1475,7 @@ const adjustSelectedConnectorThickness = (delta: number) => {
 
                           node.scaleX(1);
                           node.scaleY(1);
+                          scheduleHierarchyRefresh();
                         }}
                       />
                     </>
@@ -1174,13 +1506,14 @@ const adjustSelectedConnectorThickness = (delta: number) => {
                         }
                       }}
                       onDragEnd={(e) => {
-                        updateLayer(layer.id, {
-                          geometry: {
-                            ...layer.geometry,
-                            x: snap(e.target.x()),
-                            y: snap(e.target.y()),
-                          },
-                        });
+                        const nextX = snap(e.target.x());
+                        const nextY = snap(e.target.y());
+                        moveLayerTreeByDelta(
+                          layer.id,
+                          nextX - (layer.geometry?.x || 0),
+                          nextY - (layer.geometry?.y || 0)
+                        );
+                        scheduleHierarchyRefresh();
                       }}
                     >
                       <Rect
@@ -1285,13 +1618,14 @@ const adjustSelectedConnectorThickness = (delta: number) => {
                           }
                         }}
                         onDragEnd={(e) => {
-                          updateLayer(layer.id, {
-                            geometry: {
-                              ...layer.geometry,
-                              x: snap(e.target.x()),
-                              y: snap(e.target.y()),
-                            },
-                          });
+                          const nextX = snap(e.target.x());
+                          const nextY = snap(e.target.y());
+                          moveLayerTreeByDelta(
+                            layer.id,
+                            nextX - (layer.geometry?.x || 0),
+                            nextY - (layer.geometry?.y || 0)
+                          );
+                          scheduleHierarchyRefresh();
                         }}
                         onTransformEnd={() => {
                           const node = selectionRef.current;
@@ -1306,6 +1640,7 @@ const adjustSelectedConnectorThickness = (delta: number) => {
                           });
                           node.scaleX(1);
                           node.scaleY(1);
+                          scheduleHierarchyRefresh();
                         }}
                       />
                     );
@@ -1343,13 +1678,14 @@ const adjustSelectedConnectorThickness = (delta: number) => {
                         }
                       }}
                       onDragEnd={(e) => {
-                        updateLayer(layer.id, {
-                          geometry: {
-                            ...layer.geometry,
-                            x: snap(e.target.x()),
-                            y: snap(e.target.y()),
-                          },
-                        });
+                        const nextX = snap(e.target.x());
+                        const nextY = snap(e.target.y());
+                        moveLayerTreeByDelta(
+                          layer.id,
+                          nextX - (layer.geometry?.x || 0),
+                          nextY - (layer.geometry?.y || 0)
+                        );
+                        scheduleHierarchyRefresh();
                       }}
                       onTransformEnd={() => {
                         const node = selectionRef.current;
@@ -1364,6 +1700,7 @@ const adjustSelectedConnectorThickness = (delta: number) => {
                         });
                         node.scaleX(1);
                         node.scaleY(1);
+                        scheduleHierarchyRefresh();
                       }}
                     />
                   );
@@ -1489,6 +1826,7 @@ if (layer.type === 'connector') {
                           y: snap(e.target.y()),
                         },
                       });
+                      scheduleHierarchyRefresh();
                     }}
                     onTransformEnd={() => {
                       const node = selectionRef.current;
@@ -1503,6 +1841,7 @@ if (layer.type === 'connector') {
                       });
                       node.scaleX(1);
                       node.scaleY(1);
+                      scheduleHierarchyRefresh();
                     }}
                   />
                 );

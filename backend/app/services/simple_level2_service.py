@@ -73,14 +73,22 @@ class SimpleLevel2Service:
         # This is a geometry/content-based pass, not an LLM guess.
         final_layers = self._dedupe_layers(final_layers)
 
-        # STEP 3: Build node candidates from the canonical layers.
+        # STEP 3: Synthesize missing parent containers from geometry only.
+        # This is deterministic and only creates a container when a tight
+        # stack of child nodes strongly suggests an enclosing block.
+        final_layers = self._synthesize_missing_containers(final_layers)
+
+        # STEP 4: Deterministically infer hierarchy from geometry only.
+        final_layers = self._build_hierarchy_metadata(final_layers)
+
+        # STEP 4: Build node candidates from the canonical layers.
         node_candidates = []
         for layer in final_layers:
             candidate = self._layer_to_node_candidate(layer)
             if candidate:
                 node_candidates.append(candidate)
 
-        # STEP 4: Multimodal extraction for connections only.
+        # STEP 5: Multimodal extraction for connections only.
         graph = {"connections": []}
 
         if self.enable_graph_extraction and image_path:
@@ -92,7 +100,7 @@ class SimpleLevel2Service:
             except Exception as exc:
                 logger.exception(f"Graph extraction failed: {exc}")
 
-        # STEP 5: Build connector layers from the returned connections.
+        # STEP 6: Build connector layers from the returned connections.
         layers_by_id = {layer.id: layer for layer in final_layers}
         connector_layers = self._build_connector_layers(
             graph=graph,
@@ -101,10 +109,11 @@ class SimpleLevel2Service:
 
         final_layers.extend(connector_layers)
 
-        # STEP 6: Sort layers.
+        # STEP 7: Sort layers with parents before children and connectors behind.
         final_layers.sort(
             key=lambda l: (
                 0 if l.type == "connector" else 1,
+                int(l.content.get("depth", 0)) if isinstance(l.content, dict) else 0,
                 l.geometry.y,
                 l.geometry.x,
             )
@@ -279,6 +288,374 @@ class SimpleLevel2Service:
 
         text = re.sub(r"\s+", " ", text).lower()
         return (layer.type, text)
+
+    # ---------------------------------------------------------------------
+    # Deterministic container synthesis
+    # ---------------------------------------------------------------------
+
+    def _synthesize_missing_containers(self, layers: List[Layer]) -> List[Layer]:
+        """
+        Create a parent container only when multiple box-like children form
+        a tight vertical stack. This is used to recover missing outer blocks
+        in nested block diagrams.
+        """
+        if not layers:
+            return layers
+
+        box_layers = [
+            layer
+            for layer in layers
+            if layer.type in {"text", "shape", "container", "table"}
+            and not self._is_synthesized_container(layer)
+        ]
+
+        if len(box_layers) < 2:
+            return layers
+
+        by_id = {layer.id: layer for layer in box_layers}
+        bboxes = {layer.id: self._layer_bbox(layer) for layer in box_layers}
+        adjacency: Dict[str, set[str]] = {layer.id: set() for layer in box_layers}
+
+        for i, left in enumerate(box_layers):
+            for right in box_layers[i + 1 :]:
+                if self._looks_like_stacked_siblings(bboxes[left.id], bboxes[right.id]):
+                    adjacency[left.id].add(right.id)
+                    adjacency[right.id].add(left.id)
+
+        visited: set[str] = set()
+        components: List[List[str]] = []
+
+        for layer in box_layers:
+            if layer.id in visited:
+                continue
+
+            stack = [layer.id]
+            visited.add(layer.id)
+            component: List[str] = []
+
+            while stack:
+                current_id = stack.pop()
+                component.append(current_id)
+                for neighbor_id in adjacency.get(current_id, set()):
+                    if neighbor_id in visited:
+                        continue
+                    visited.add(neighbor_id)
+                    stack.append(neighbor_id)
+
+            components.append(component)
+
+        synthetic_layers: List[Layer] = []
+        seen_signatures = set()
+
+        for idx, component_ids in enumerate(components):
+            if len(component_ids) < 2:
+                continue
+
+            component_layers = [by_id[layer_id] for layer_id in component_ids]
+            if not self._is_strong_container_candidate(component_layers, bboxes):
+                continue
+
+            x1 = min(bboxes[layer_id][0] for layer_id in component_ids)
+            y1 = min(bboxes[layer_id][1] for layer_id in component_ids)
+            x2 = max(bboxes[layer_id][0] + bboxes[layer_id][2] for layer_id in component_ids)
+            y2 = max(bboxes[layer_id][1] + bboxes[layer_id][3] for layer_id in component_ids)
+
+            width = max(1.0, x2 - x1)
+            height = max(1.0, y2 - y1)
+            padding = max(8.0, min(18.0, min(width, height) * 0.08))
+
+            geometry = GeometryBase(
+                x=max(0.0, x1 - padding),
+                y=max(0.0, y1 - padding),
+                w=width + padding * 2,
+                h=height + padding * 2,
+            )
+
+            signature = (
+                round(geometry.x, 1),
+                round(geometry.y, 1),
+                round(geometry.w, 1),
+                round(geometry.h, 1),
+                tuple(sorted(component_ids)),
+            )
+            if signature in seen_signatures:
+                continue
+            seen_signatures.add(signature)
+
+            synthetic_layers.append(
+                Layer(
+                    id=f"synthetic_container_{idx}",
+                    type="container",
+                    geometry=geometry,
+                    content={
+                        "editable": True,
+                        "is_synthesized": True,
+                        "synthesized_from": sorted(component_ids),
+                        "nesting_role": "container",
+                        "is_container": True,
+                    },
+                    style={
+                        "stroke": "#64748b",
+                        "strokeWidth": 1.5,
+                        "fill": "rgba(255,255,255,0.0)",
+                    },
+                )
+            )
+
+        if not synthetic_layers:
+            return layers
+
+        combined = list(layers) + synthetic_layers
+        order_lookup = {layer.id: idx for idx, layer in enumerate(layers)}
+        order_lookup.update({layer.id: len(layers) + idx for idx, layer in enumerate(synthetic_layers)})
+        combined.sort(key=lambda layer: (order_lookup.get(layer.id, 10**9), layer.geometry.y, layer.geometry.x))
+        return combined
+
+    def _looks_like_stacked_siblings(
+        self,
+        a: Tuple[float, float, float, float],
+        b: Tuple[float, float, float, float],
+    ) -> bool:
+        ax, ay, aw, ah = a
+        bx, by, bw, bh = b
+
+        left = max(ax, bx)
+        right = min(ax + aw, bx + bw)
+        overlap_w = max(0.0, right - left)
+        min_w = max(1.0, min(aw, bw))
+        overlap_ratio = overlap_w / min_w
+
+        center_delta = abs((ax + aw / 2) - (bx + bw / 2))
+        width_ratio = min(aw, bw) / max(aw, bw)
+
+        if ay <= by:
+            vertical_gap = by - (ay + ah)
+        else:
+            vertical_gap = ay - (by + bh)
+
+        return (
+            overlap_ratio >= 0.35
+            and center_delta <= max(aw, bw) * 0.25
+            and width_ratio >= 0.55
+            and -6.0 <= vertical_gap <= 36.0
+        )
+
+    def _is_strong_container_candidate(
+        self,
+        component_layers: List[Layer],
+        bboxes: Dict[str, Tuple[float, float, float, float]],
+    ) -> bool:
+        if len(component_layers) < 2:
+            return False
+
+        widths = [bboxes[layer.id][2] for layer in component_layers]
+        heights = [bboxes[layer.id][3] for layer in component_layers]
+        x_centers = [bboxes[layer.id][0] + bboxes[layer.id][2] / 2 for layer in component_layers]
+
+        width_spread = max(widths) / max(1e-6, min(widths))
+        height_spread = max(heights) / max(1e-6, min(heights))
+        center_spread = max(x_centers) - min(x_centers)
+
+        union_left = min(bboxes[layer.id][0] for layer in component_layers)
+        union_right = max(bboxes[layer.id][0] + bboxes[layer.id][2] for layer in component_layers)
+        union_width = max(1.0, union_right - union_left)
+
+        # Reject loose groups. We only want tight nested stacks.
+        if width_spread > 1.9 and height_spread > 2.4:
+            return False
+
+        if center_spread > union_width * 0.35:
+            return False
+
+        # Require the group to be meaningfully stacked rather than just close.
+        sorted_layers = sorted(component_layers, key=lambda layer: (bboxes[layer.id][1], bboxes[layer.id][0]))
+        gaps = []
+        for prev, cur in zip(sorted_layers, sorted_layers[1:]):
+            px, py, pw, ph = bboxes[prev.id]
+            cx, cy, cw, ch = bboxes[cur.id]
+            gap = cy - (py + ph)
+            gaps.append(gap)
+
+        if not gaps:
+            return False
+
+        avg_gap = sum(gaps) / len(gaps)
+        return avg_gap <= 24.0
+
+    def _is_synthesized_container(self, layer: Layer) -> bool:
+        content = layer.content if isinstance(layer.content, dict) else {}
+        return bool(content.get("is_synthesized"))
+
+    # ---------------------------------------------------------------------
+    # Deterministic hierarchy inference
+    # ---------------------------------------------------------------------
+
+    def _build_hierarchy_metadata(self, layers: List[Layer]) -> List[Layer]:
+        """
+        Build a deterministic containment tree from geometry only.
+
+        The rule is intentionally strict:
+        - only box-like layers participate,
+        - a parent must fully contain the child with a small margin,
+        - the smallest enclosing parent becomes the immediate parent,
+        - hierarchy metadata is stored in content without changing geometry.
+        """
+        if not layers:
+            return layers
+
+        candidates = [
+            layer
+            for layer in layers
+            if layer.type in {"text", "shape", "container", "table"}
+        ]
+
+        if not candidates:
+            return layers
+
+        bbox_lookup: Dict[str, Tuple[float, float, float, float]] = {
+            layer.id: self._layer_bbox(layer)
+            for layer in candidates
+        }
+
+        parent_map: Dict[str, str] = {}
+        children_map: Dict[str, List[str]] = {layer.id: [] for layer in candidates}
+
+        for child in candidates:
+            child_box = bbox_lookup[child.id]
+            containing: List[Tuple[float, float, float, str, Layer]] = []
+
+            for parent in candidates:
+                if parent.id == child.id:
+                    continue
+
+                parent_box = bbox_lookup[parent.id]
+                if not self._contains_bbox(parent_box, child_box):
+                    continue
+
+                area = parent_box[2] * parent_box[3]
+                containing.append((area, parent_box[1], parent_box[0], parent.id, parent))
+
+            if not containing:
+                continue
+
+            containing.sort(key=lambda item: (item[0], item[1], item[2], item[3]))
+            parent = containing[0][4]
+            parent_map[child.id] = parent.id
+            children_map.setdefault(parent.id, []).append(child.id)
+
+        depth_cache: Dict[str, int] = {}
+
+        def compute_depth(layer_id: str) -> int:
+            if layer_id in depth_cache:
+                return depth_cache[layer_id]
+            parent_id = parent_map.get(layer_id)
+            if not parent_id:
+                depth_cache[layer_id] = 0
+            else:
+                depth_cache[layer_id] = compute_depth(parent_id) + 1
+            return depth_cache[layer_id]
+
+        for layer in candidates:
+            compute_depth(layer.id)
+
+        updated_layers: List[Layer] = []
+        for layer in layers:
+            cloned = copy.deepcopy(layer)
+
+            if isinstance(cloned.content, dict):
+                content = dict(cloned.content)
+            else:
+                content = {
+                    "text": getattr(cloned.content, "text", ""),
+                }
+
+            child_ids = sorted(
+                children_map.get(cloned.id, []),
+                key=lambda child_id: (
+                    bbox_lookup[child_id][1],
+                    bbox_lookup[child_id][0],
+                    child_id,
+                ),
+            )
+
+            depth = depth_cache.get(cloned.id, 0)
+            parent_id = parent_map.get(cloned.id)
+
+            if parent_id:
+                content["parent_id"] = parent_id
+            else:
+                content.pop("parent_id", None)
+
+            content["children_ids"] = child_ids
+            content["depth"] = depth
+            content["is_container"] = bool(child_ids)
+
+            if cloned.type == "text":
+                if parent_id or content.get("synthesized_from"):
+                    content["nesting_role"] = "node"
+                elif child_ids:
+                    content["nesting_role"] = "text_container"
+                else:
+                    content["nesting_role"] = "label"
+            elif child_ids:
+                content["nesting_role"] = "container"
+            else:
+                content["nesting_role"] = "node"
+
+            cloned.content = content
+            updated_layers.append(cloned)
+
+        return updated_layers
+
+    def _contains_bbox(
+        self,
+        outer: Tuple[float, float, float, float],
+        inner: Tuple[float, float, float, float],
+    ) -> bool:
+        ox, oy, ow, oh = outer
+        ix, iy, iw, ih = inner
+
+        margin = max(2.0, min(8.0, min(ow, oh) * 0.03))
+
+        return (
+            ix >= ox + margin
+            and iy >= oy + margin
+            and ix + iw <= ox + ow - margin
+            and iy + ih <= oy + oh - margin
+        )
+
+    def _resolve_connector_layer(
+        self,
+        layer: Layer,
+        layers_by_id: Dict[str, Layer],
+    ) -> Layer:
+        """
+        If a connector endpoint points to a text label, resolve it to the
+        immediate enclosing block so arrows attach to the actual node.
+        """
+        current = layer
+        visited = set()
+
+        while current.id not in visited:
+            visited.add(current.id)
+            content = current.content if isinstance(current.content, dict) else {}
+            parent_id = content.get("parent_id")
+            if not parent_id:
+                break
+
+            parent = layers_by_id.get(str(parent_id))
+            if not parent:
+                break
+
+            if current.type == "text":
+                role = content.get("nesting_role")
+                if role == "label":
+                    current = parent
+                    continue
+
+            break
+
+        return current
 
     # ---------------------------------------------------------------------
     # Candidate serialization
@@ -468,8 +845,8 @@ RETURN FORMAT:
             if source_id not in layers_by_id or target_id not in layers_by_id:
                 continue
 
-            src = layers_by_id[source_id]
-            dst = layers_by_id[target_id]
+            src = self._resolve_connector_layer(layers_by_id[source_id], layers_by_id)
+            dst = self._resolve_connector_layer(layers_by_id[target_id], layers_by_id)
 
             source_anchor, target_anchor = self._determine_anchor_sides(src.geometry, dst.geometry)
             points = self._route_connector(
@@ -496,8 +873,8 @@ RETURN FORMAT:
                         "direction": "forward",
                         "style": "solid",
                         "route_mode": "orthogonal",
-                        "source_layer_id": source_id,
-                        "target_layer_id": target_id,
+                        "source_layer_id": src.id,
+                        "target_layer_id": dst.id,
                         "source_anchor": source_anchor,
                         "target_anchor": target_anchor,
                     },
