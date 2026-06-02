@@ -16,6 +16,7 @@ class PipelineStatus(BaseModel):
 class PipelineResult(BaseModel):
     project_id: str
     document: Page
+    debug_image_url: Optional[str] = None
     fidelity_score: float = 1.0
     skipped_elements: List[SkippedElement] = []
     low_resolution_flag: bool = False

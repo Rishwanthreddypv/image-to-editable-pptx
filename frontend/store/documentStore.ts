@@ -8,11 +8,15 @@ interface DocumentState {
   history: EditableDocument[];
   historyIndex: number;
   pageSettings: PageSettings;
+  activeTool: 'select' | 'rectangle' | 'container' | 'connector';
   
   setDocument: (doc: EditableDocument) => void;
   selectLayer: (id: string | null) => void;
+  addLayer: (layer: DocumentLayer) => void;
   updateLayer: (id: string, updates: Partial<DocumentLayer>) => void;
   deleteLayer: (id: string) => void;
+  clearDocument: () => void;
+  setTool: (tool: 'select' | 'rectangle' | 'container' | 'connector') => void;
   updatePageSettings: (updates: Partial<PageSettings>) => void;
   setLoading: (loading: boolean) => void;
   
@@ -27,6 +31,7 @@ export const useDocumentStore = create<DocumentState>((set) => ({
   isLoading: false,
   history: [],
   historyIndex: -1,
+  activeTool: 'select',
   pageSettings: {
     backgroundColor: '#ffffff',
     showGrid: true,
@@ -48,10 +53,32 @@ export const useDocumentStore = create<DocumentState>((set) => ({
 
   selectLayer: (id) => set({ selectedLayerId: id }),
 
+  addLayer: (layer) => set((state) => {
+    if (!state.document) return state;
+    const newLayers = [...state.document.layers, layer];
+    const newDoc = { ...state.document, layers: newLayers };
+    
+    const newHistory = state.history.slice(0, state.historyIndex + 1);
+    newHistory.push(newDoc);
+    
+    return {
+      document: newDoc,
+      history: newHistory,
+      historyIndex: newHistory.length - 1,
+      selectedLayerId: layer.id,
+      activeTool: 'select' // Auto-switch back to select after adding
+    };
+  }),
+
   updateLayer: (id, updates) => set((state) => {
     if (!state.document) return state;
     const newLayers = state.document.layers.map(l => 
-      l.id === id ? { ...l, ...updates, content: { ...l.content, ...(updates.content || {}) }, style: { ...l.style, ...(updates.style || {}) } } : l
+      l.id === id ? { 
+        ...l, 
+        ...updates, 
+        content: { ...l.content, ...(updates.content || {}) }, 
+        style: { ...l.style, ...(updates.style || {}) } 
+      } : l
     );
     const newDoc = { ...state.document, layers: newLayers };
     
@@ -81,6 +108,15 @@ export const useDocumentStore = create<DocumentState>((set) => ({
       selectedLayerId: state.selectedLayerId === id ? null : state.selectedLayerId
     };
   }),
+
+  clearDocument: () => set({ 
+    document: null, 
+    history: [], 
+    historyIndex: -1, 
+    selectedLayerId: null 
+  }),
+
+  setTool: (tool) => set({ activeTool: tool }),
 
   updatePageSettings: (updates) => set((state) => ({
     pageSettings: { ...state.pageSettings, ...updates }

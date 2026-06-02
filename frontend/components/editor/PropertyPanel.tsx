@@ -2,6 +2,7 @@
 import { useDocumentStore } from '@/store/documentStore';
 import { TextLayerEditor } from './TextLayerEditor';
 import { TableLayerEditor } from './TableLayerEditor';
+import { ShapeLayerEditor } from './ShapeLayerEditor';
 import { Settings, Maximize2, Move, Layout, Grid, Eye } from 'lucide-react';
 
 export const PropertyPanel = () => {
@@ -161,6 +162,7 @@ export const PropertyPanel = () => {
 
         {layer.type === 'text' && <TextLayerEditor />}
         {layer.type === 'table' && <TableLayerEditor />}
+        {(layer.type === 'container' || layer.type === 'connector') && <ShapeLayerEditor />}
       </div>
     </div>
   );

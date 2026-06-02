@@ -4,6 +4,7 @@ import { useParams } from "next/navigation";
 import { useDocumentStore } from "@/store/documentStore";
 import { documentApi } from "@/lib/api";
 import { TopBar } from '@/components/editor/TopBar';
+import { Toolbar } from '@/components/editor/Toolbar';
 import { LayerSidebar } from '@/components/editor/LayerSidebar';
 import { PropertyPanel } from '@/components/editor/PropertyPanel';
 import { Spinner } from '@/components/common/Spinner';
@@ -130,7 +131,8 @@ export default function DocumentEditor() {
           )}
         </div>
       )}
-      <div className="flex-1 flex overflow-hidden">
+      <div className="flex-1 flex overflow-hidden relative">
+        <Toolbar />
         <LayerSidebar />
         <EditorCanvas />
         <PropertyPanel />

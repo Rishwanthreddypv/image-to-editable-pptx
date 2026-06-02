@@ -5,7 +5,7 @@ export interface Geometry {
   h: number;
 }
 
-export type LayerType = 'text' | 'table' | 'figure' | 'image' | 'shape';
+export type LayerType = 'text' | 'table' | 'figure' | 'image' | 'shape' | 'container' | 'connector';
 
 export interface TextStyle {
   fontSize: number;

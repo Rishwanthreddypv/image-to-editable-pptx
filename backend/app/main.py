@@ -12,6 +12,10 @@ app = FastAPI(title="Editable Image to PPTX API")
 os.makedirs(settings.UPLOAD_DIR, exist_ok=True)
 
 # Serve static files
+# Mount root for debug images
+project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+app.mount("/root", StaticFiles(directory=project_root), name="root")
+
 app.mount("/uploads", StaticFiles(directory=settings.UPLOAD_DIR), name="uploads")
 
 # Configure CORS

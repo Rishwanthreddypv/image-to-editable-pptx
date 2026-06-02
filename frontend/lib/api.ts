@@ -12,7 +12,7 @@ export const documentApi = {
     const { data } = await api.post('/upload/', formData);
     return data;
   },
-  getDocumentStatus: async (id: string): Promise<{status: string, progress: number}> => {
+  getDocumentStatus: async (id: string): Promise<{status: string, progress: number, skipped_elements?: any[]}> => {
     const { data } = await api.get(`/document/${id}/status`);
     return data;
   },

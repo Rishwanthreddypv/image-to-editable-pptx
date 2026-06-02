@@ -4,7 +4,7 @@
 The system uses a **Vision-to-Layout** pipeline that leverages Large Multimodal Models (LMMs) to bypass traditional OCR-heavy heuristics, directly converting images into structured editable layers.
 
 ## Core Technologies
-- **AI Engine**: Google Gemini 1.5 Flash.
+- **AI Engine**: Azure OpenAI (GPT-4o).
 - **Backend**: FastAPI (Python), OpenCV, `python-pptx`.
 - **Frontend**: Next.js, Konva.js (16:9 interactive canvas).
 

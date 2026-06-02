@@ -36,12 +36,17 @@ class DocumentService:
         self._status[project_id].update({"status": status, "progress": progress})
         self._status[project_id].update(kwargs)
 
-    async def save_document(self, project_id: str, document_page):
+    async def save_document(self, project_id: str, document_page, debug_image_url: str = None):
         # Model dump ensures it serializes well to dict
         data = document_page.model_dump()
         # Ensure we keep the source image reference if it exists
         if project_id in self._status:
-            data["sourceImage"] = self._status[project_id].get("sourceImage")
+            # Use debug image for reference if available, otherwise original upload
+            original_source = self._status[project_id].get("sourceImage")
+            data["sourceImage"] = debug_image_url or original_source
+        elif debug_image_url:
+            data["sourceImage"] = debug_image_url
+            
         self._store[project_id] = data
 
 document_service = DocumentService()

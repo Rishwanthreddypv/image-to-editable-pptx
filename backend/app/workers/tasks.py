@@ -19,7 +19,7 @@ async def process_image_task(project_id: str, image_path: str):
         result = await pipeline_service.run_pipeline(project_id, image_path)
         
         # Save the structured document model
-        await document_service.save_document(project_id, result.document)
+        await document_service.save_document(project_id, result.document, debug_image_url=result.debug_image_url)
         
         await asyncio.sleep(0.5)
         await document_service.set_status(
@@ -30,7 +30,8 @@ async def process_image_task(project_id: str, image_path: str):
             low_resolution_flag=result.low_resolution_flag,
             confidence_level=result.confidence_level,
             edge_cases_encountered=result.edge_cases_encountered,
-            skipped_elements=[s.model_dump() for s in result.skipped_elements]
+            skipped_elements=[s.model_dump() for s in result.skipped_elements],
+            debug_image_url=result.debug_image_url
         )
         logger.info(f"Background task completed for {project_id}")
     except Exception as e:

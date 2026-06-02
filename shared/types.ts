@@ -5,7 +5,7 @@ export interface Geometry {
   h: number;
 }
 
-export type LayerType = 'text' | 'table' | 'figure' | 'image';
+export type LayerType = 'text' | 'table' | 'figure' | 'image' | 'shape' | 'container' | 'connector';
 
 export interface DocumentLayer {
   id: string;

@@ -12,6 +12,9 @@ class LayerBase(BaseModel):
     geometry: GeometryBase
     content: dict
     style: Optional[dict] = {}
+    parent_group_id: Optional[str] = None
+    group_type: Optional[str] = None
+    child_layer_ids: Optional[List[str]] = []
 
 class LayerCreate(LayerBase):
     pass
